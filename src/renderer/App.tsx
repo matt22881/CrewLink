@@ -1,5 +1,7 @@
 import React, {
 	Dispatch,
+	ErrorInfo,
+	ReactChild,
 	SetStateAction,
 	useEffect,
 	useReducer,
@@ -8,7 +10,7 @@ import React, {
 import ReactDOM from 'react-dom';
 import Voice from './Voice';
 import Menu from './Menu';
-import { ipcRenderer, remote } from 'electron';
+import { ipcRenderer } from 'electron';
 import { AmongUsState } from '../common/AmongUsState';
 import Settings, {
 	settingsReducer,
@@ -20,11 +22,30 @@ import {
 	LobbySettingsContext,
 } from './contexts';
 import { ThemeProvider } from '@material-ui/core/styles';
+import {
+	AutoUpdaterState,
+	IpcHandlerMessages,
+	IpcMessages,
+	IpcOverlayMessages,
+	IpcRendererMessages,
+	IpcSyncMessages,
+} from '../common/ipc-messages';
 import theme from './theme';
 import SettingsIcon from '@material-ui/icons/Settings';
 import CloseIcon from '@material-ui/icons/Close';
 import IconButton from '@material-ui/core/IconButton';
+import Dialog from '@material-ui/core/Dialog';
 import makeStyles from '@material-ui/core/styles/makeStyles';
+import LinearProgress from '@material-ui/core/LinearProgress';
+import DialogTitle from '@material-ui/core/DialogTitle';
+import DialogContent from '@material-ui/core/DialogContent';
+import DialogContentText from '@material-ui/core/DialogContentText';
+import DialogActions from '@material-ui/core/DialogActions';
+import Button from '@material-ui/core/Button';
+import prettyBytes from 'pretty-bytes';
+import './css/index.css';
+import Typography from '@material-ui/core/Typography';
+import SupportLink from './SupportLink';
 
 let appVersion = '';
 if (typeof window !== 'undefined' && window.location) {
@@ -83,7 +104,7 @@ const TitleBar: React.FC<TitleBarProps> = function ({
 				className={classes.button}
 				style={{ right: 0 }}
 				size="small"
-				onClick={() => remote.getCurrentWindow().close()}
+				onClick={() => ipcRenderer.send(IpcMessages.QUIT_CREWLINK)}
 			>
 				<CloseIcon htmlColor="#777" />
 			</IconButton>
@@ -96,11 +117,74 @@ enum AppState {
 	VOICE,
 }
 
-function App() {
+interface ErrorBoundaryProps {
+	children: ReactChild;
+}
+interface ErrorBoundaryState {
+	error?: Error;
+}
+
+class ErrorBoundary extends React.Component<
+	ErrorBoundaryProps,
+	ErrorBoundaryState
+> {
+	constructor(props: ErrorBoundaryProps) {
+		super(props);
+		this.state = {};
+	}
+
+	static getDerivedStateFromError(error: Error): ErrorBoundaryState {
+		// Update state so the next render will show the fallback UI.
+		return { error };
+	}
+
+	componentDidCatch(error: Error, errorInfo: ErrorInfo) {
+		console.error('React Error: ', error, errorInfo);
+	}
+
+	render(): ReactChild {
+		if (this.state.error) {
+			return (
+				<div style={{ paddingTop: 16 }}>
+					<Typography align="center" variant="h6" color="error">
+						REACT ERROR
+					</Typography>
+					<Typography
+						align="center"
+						style={{
+							whiteSpace: 'pre-wrap',
+							fontSize: 12,
+							maxHeight: 200,
+							overflowY: 'auto',
+						}}
+					>
+						{this.state.error.stack}
+					</Typography>
+					<SupportLink />
+					<Button
+						style={{ margin: '10px auto', display: 'block' }}
+						variant="contained"
+						color="secondary"
+						onClick={() => window.location.reload()}
+					>
+						Reload App
+					</Button>
+				</div>
+			);
+		}
+
+		return this.props.children;
+	}
+}
+
+const App: React.FC = function () {
 	const [state, setState] = useState<AppState>(AppState.MENU);
 	const [gameState, setGameState] = useState<AmongUsState>({} as AmongUsState);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [error, setError] = useState('');
+	const [updaterState, setUpdaterState] = useState<AutoUpdaterState>({
+		state: 'unavailable',
+	});
 	const settings = useReducer(settingsReducer, {
 		alwaysOnTop: false,
 		microphone: 'Default',
@@ -112,11 +196,19 @@ function App() {
 		muteShortcut: 'RAlt',
 		hideCode: false,
 		enableSpatialAudio: true,
+		meetingOverlay: true,
+		overlayPosition: 'right',
 		localLobbySettings: {
 			maxDistance: 5.32,
+			haunting: false,
+			hearImpostorsInVents: false,
+			commsSabotage: true,
 		},
 	});
-	const lobbySettings = useReducer(lobbySettingsReducer, settings[0].localLobbySettings);
+	const lobbySettings = useReducer(
+		lobbySettingsReducer,
+		settings[0].localLobbySettings
+	);
 
 	useEffect(() => {
 		const onOpen = (_: Electron.IpcRendererEvent, isOpen: boolean) => {
@@ -125,23 +217,64 @@ function App() {
 		const onState = (_: Electron.IpcRendererEvent, newState: AmongUsState) => {
 			setGameState(newState);
 		};
-		let shouldInit = true;
 		const onError = (_: Electron.IpcRendererEvent, error: string) => {
 			shouldInit = false;
 			setError(error);
 		};
-		ipcRenderer.on('gameOpen', onOpen);
-		ipcRenderer.on('error', onError);
-		ipcRenderer.on('gameState', onState);
-		ipcRenderer.once('started', () => {
-			if (shouldInit) setGameState(ipcRenderer.sendSync('initState'));
-		});
+		const onAutoUpdaterStateChange = (
+			_: Electron.IpcRendererEvent,
+			state: AutoUpdaterState
+		) => {
+			setUpdaterState((old) => ({ ...old, ...state }));
+		};
+		let shouldInit = true;
+		ipcRenderer
+			.invoke(IpcHandlerMessages.START_HOOK)
+			.then(() => {
+				if (shouldInit) {
+					setGameState(ipcRenderer.sendSync(IpcSyncMessages.GET_INITIAL_STATE));
+				}
+			})
+			.catch((error: Error) => {
+				if (shouldInit) {
+					shouldInit = false;
+					setError(error.message);
+				}
+			});
+		ipcRenderer.on(
+			IpcRendererMessages.AUTO_UPDATER_STATE,
+			onAutoUpdaterStateChange
+		);
+		ipcRenderer.on(IpcRendererMessages.NOTIFY_GAME_OPENED, onOpen);
+		ipcRenderer.on(IpcRendererMessages.NOTIFY_GAME_STATE_CHANGED, onState);
+		ipcRenderer.on(IpcRendererMessages.ERROR, onError);
 		return () => {
-			ipcRenderer.off('gameOpen', onOpen);
-			ipcRenderer.off('error', onError);
-			ipcRenderer.off('gameState', onState);
+			ipcRenderer.off(
+				IpcRendererMessages.AUTO_UPDATER_STATE,
+				onAutoUpdaterStateChange
+			);
+			ipcRenderer.off(IpcRendererMessages.NOTIFY_GAME_OPENED, onOpen);
+			ipcRenderer.off(IpcRendererMessages.NOTIFY_GAME_STATE_CHANGED, onState);
+			ipcRenderer.off(IpcRendererMessages.ERROR, onError);
+			shouldInit = false;
 		};
 	}, []);
+
+	useEffect(() => {
+		ipcRenderer.send(
+			IpcMessages.SEND_TO_OVERLAY,
+			IpcOverlayMessages.NOTIFY_GAME_STATE_CHANGED,
+			gameState
+		);
+	}, [gameState]);
+
+	useEffect(() => {
+		ipcRenderer.send(
+			IpcMessages.SEND_TO_OVERLAY,
+			IpcOverlayMessages.NOTIFY_SETTINGS_CHANGED,
+			settings[0]
+		);
+	}, [settings]);
 
 	let page;
 	switch (state) {
@@ -152,6 +285,7 @@ function App() {
 			page = <Voice error={error} />;
 			break;
 	}
+
 	return (
 		<GameStateContext.Provider value={gameState}>
 			<LobbySettingsContext.Provider value={lobbySettings}>
@@ -161,16 +295,55 @@ function App() {
 							settingsOpen={settingsOpen}
 							setSettingsOpen={setSettingsOpen}
 						/>
-						<Settings
-							open={settingsOpen}
-							onClose={() => setSettingsOpen(false)}
-						/>
-						{page}
+						<ErrorBoundary>
+							<>
+								<Settings
+									open={settingsOpen}
+									onClose={() => setSettingsOpen(false)}
+								/>
+								<Dialog fullWidth open={updaterState.state !== 'unavailable'}>
+									<DialogTitle>Updating...</DialogTitle>
+									<DialogContent>
+										{(updaterState.state === 'downloading' ||
+											updaterState.state === 'downloaded') &&
+											updaterState.progress && (
+												<>
+													<LinearProgress
+														variant={
+															updaterState.state === 'downloaded'
+																? 'indeterminate'
+																: 'determinate'
+														}
+														value={updaterState.progress.percent}
+													/>
+													<DialogContentText>
+														{prettyBytes(updaterState.progress.transferred)} /{' '}
+														{prettyBytes(updaterState.progress.total)}
+													</DialogContentText>
+												</>
+											)}
+										{updaterState.state === 'error' && (
+											<DialogContentText color="error">
+												{updaterState.error}
+											</DialogContentText>
+										)}
+									</DialogContent>
+									{updaterState.state === 'error' && (
+										<DialogActions>
+											<Button href="https://github.com/ottomated/CrewLink/releases/latest">
+												Download Manually
+											</Button>
+										</DialogActions>
+									)}
+								</Dialog>
+								{page}
+							</>
+						</ErrorBoundary>
 					</ThemeProvider>
 				</SettingsContext.Provider>
 			</LobbySettingsContext.Provider>
 		</GameStateContext.Provider>
 	);
-}
+};
 
 ReactDOM.render(<App />, document.getElementById('app'));
